@@ -1,0 +1,564 @@
+import os
+import sys
+import asyncio
+import sqlite3
+import subprocess
+import signal
+import shutil
+import zipfile
+import psutil
+import re
+import time
+from pathlib import Path
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes, ConversationHandler
+)
+
+# ============ الإعدادات الأساسية ============
+BOT_TOKEN = "8907754389:AAHw58vzATqDK4X6k789xG2Q2I2bF5C9SEY"  # ⚠️ غيّره فوراً
+DEV_IDS = [8772508181, 7540856297]
+DEV_NAME = "𝑨𝑳𝑩𝑨𝑩𝑨 𝑨𝑳𝑮𝑬𝑵𝑬𝑹𝑨𝑳"
+DEV_URL = "https://t.me/ELBABAELGENERAL1"
+CHANNEL_URL = "https://t.me/algeneraleth"
+
+# الحدود الافتراضية للمستخدم العادي
+DEFAULT_MAX_BOTS = 2
+DEFAULT_MAX_SITES = 1
+
+BASE_DIR = Path.home() / "hosting_platform"
+BOTS_DIR = BASE_DIR / "bots"
+SITES_DIR = BASE_DIR / "sites"
+BOTS_DIR.mkdir(parents=True, exist_ok=True)
+SITES_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = str(Path.home() / "platform.db")
+
+# حالات المحادثة
+NEWBOT_NAME, NEWBOT_FILE = range(2)
+NEWSITE_NAME, NEWSITE_FILE = range(3, 5)
+BROADCAST_MSG = 10
+SET_LIMIT_ID, SET_LIMIT_BOTS, SET_LIMIT_SITES = range(20, 23)
+
+# ============ قاعدة البيانات ============
+def db(): return sqlite3.connect(DB_PATH)
+
+def init_db():
+    conn = db(); c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY, first_name TEXT, username TEXT,
+        max_bots INTEGER DEFAULT 2, max_sites INTEGER DEFAULT 1)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS channels (
+        channel_id TEXT PRIMARY KEY, channel_name TEXT, invite_link TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS hosted_bots (
+        bot_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+        name TEXT, file_path TEXT, status TEXT DEFAULT 'stopped', pid INTEGER)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS hosted_sites (
+        site_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+        name TEXT, file_path TEXT, port INTEGER, url TEXT, status TEXT DEFAULT 'stopped', pid INTEGER)""")
+    conn.commit(); conn.close()
+
+def add_user(uid, fn, un):
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id, first_name, username, max_bots, max_sites) VALUES (?,?,?,?,?)", 
+              (uid, fn, un or "", DEFAULT_MAX_BOTS, DEFAULT_MAX_SITES))
+    conn.commit(); conn.close()
+
+def get_user(uid):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT user_id, first_name, max_bots, max_sites FROM users WHERE user_id=?", (uid,))
+    r = c.fetchone(); conn.close(); return r
+
+def set_user_limits(uid, max_bots, max_sites):
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE users SET max_bots=?, max_sites=? WHERE user_id=?", (max_bots, max_sites, uid))
+    conn.commit(); conn.close()
+
+def get_channels():
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT channel_id, channel_name, invite_link FROM channels")
+    r = c.fetchall(); conn.close(); return r
+
+def add_channel(cid, cn, cl):
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO channels VALUES (?,?,?)", (cid, cn, cl))
+    conn.commit(); conn.close()
+
+def remove_channel(cid):
+    conn = db(); c = conn.cursor()
+    c.execute("DELETE FROM channels WHERE channel_id=?", (cid,))
+    conn.commit(); conn.close()
+
+def get_all_users():
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT user_id FROM users")
+    r = [x[0] for x in c.fetchall()]; conn.close(); return r
+
+# --- دوال البوتات ---
+def add_bot_db(user_id, name, file_path):
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO hosted_bots (user_id, name, file_path) VALUES (?,?,?)", (user_id, name, file_path))
+    bid = c.lastrowid; conn.commit(); conn.close(); return bid
+
+def get_user_bots(uid):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT bot_id, name, status FROM hosted_bots WHERE user_id=?", (uid,))
+    r = c.fetchall(); conn.close(); return r
+
+def count_user_bots(uid):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM hosted_bots WHERE user_id=?", (uid,))
+    r = c.fetchone()[0]; conn.close(); return r
+
+def get_bot(bid):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT bot_id, user_id, name, file_path, status, pid FROM hosted_bots WHERE bot_id=?", (bid,))
+    r = c.fetchone(); conn.close(); return r
+
+def update_bot_status(bid, status, pid=None):
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE hosted_bots SET status=?, pid=? WHERE bot_id=?", (status, pid, bid))
+    conn.commit(); conn.close()
+
+def delete_bot_db(bid):
+    conn = db(); c = conn.cursor()
+    c.execute("DELETE FROM hosted_bots WHERE bot_id=?", (bid,))
+    conn.commit(); conn.close()
+
+# --- دوال المواقع ---
+def add_site_db(user_id, name, file_path, port):
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO hosted_sites (user_id, name, file_path, port) VALUES (?,?,?,?)", (user_id, name, file_path, port))
+    sid = c.lastrowid; conn.commit(); conn.close(); return sid
+
+def get_user_sites(uid):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT site_id, name, status, url FROM hosted_sites WHERE user_id=?", (uid,))
+    r = c.fetchall(); conn.close(); return r
+
+def count_user_sites(uid):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM hosted_sites WHERE user_id=?", (uid,))
+    r = c.fetchone()[0]; conn.close(); return r
+
+def get_site(sid):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT site_id, user_id, name, file_path, port, url, status, pid FROM hosted_sites WHERE site_id=?", (sid,))
+    r = c.fetchone(); conn.close(); return r
+
+def update_site_status(sid, status, pid=None, url=None):
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE hosted_sites SET status=?, pid=?, url=? WHERE site_id=?", (status, pid, url, sid))
+    conn.commit(); conn.close()
+
+def delete_site_db(sid):
+    conn = db(); c = conn.cursor()
+    c.execute("DELETE FROM hosted_sites WHERE site_id=?", (sid,))
+    conn.commit(); conn.close()
+
+# ============ إدارة العمليات ============
+def is_running(pid):
+    if not pid: return False
+    try: os.kill(pid, 0); return True
+    except (ProcessLookupError, PermissionError): return False
+
+def start_bot_process(bid):
+    row = get_bot(bid)
+    if not row: return False, "غير موجود"
+    _, uid, name, file_path, _, old_pid = row
+    if is_running(old_pid): return False, "يعمل بالفعل"
+    fp = Path(file_path)
+    if not fp.exists(): return False, "الملف غير موجود"
+    
+    try:
+        log_path = fp.parent / "bot.log"
+        with open(log_path, "w") as log:
+            proc = subprocess.Popen([sys.executable, "-u", str(fp)], cwd=str(fp.parent),
+                                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        update_bot_status(bid, "running", proc.pid)
+        return True, "تم التشغيل"
+    except Exception as e:
+        return False, str(e)
+
+def stop_bot_process(bid):
+    row = get_bot(bid)
+    if not row: return False, "غير موجود"
+    _, _, _, _, _, pid = row
+    if not pid: return False, "متوقف"
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        update_bot_status(bid, "stopped", None)
+        return True, "تم الإيقاف"
+    except Exception:
+        update_bot_status(bid, "stopped", None)
+        return True, "تم الإيقاف"
+
+def start_site_process(sid):
+    row = get_site(sid)
+    if not row: return False, "غير موجود"
+    _, uid, name, file_path, port, old_url, status, old_pid = row
+    if is_running(old_pid): return False, "يعمل بالفعل"
+    
+    fp = Path(file_path)
+    index_file = fp / "index.html"
+    if not index_file.exists(): return False, "ملف index.html غير موجود"
+    
+    try:
+        http_log = open(fp.parent / "http.log", "w")
+        http_proc = subprocess.Popen([sys.executable, "-m", "http.server", str(port)], cwd=str(fp),
+                                     stdout=http_log, stderr=subprocess.STDOUT, start_new_session=True)
+        
+        cf_log = open(fp.parent / "cf.log", "w")
+        cf_proc = subprocess.Popen(["cloudflared", "tunnel", "--url", f"http://localhost:{port}"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        
+        url = "جاري التجهيز..."
+        time.sleep(4)
+        for line in cf_proc.stdout:
+            match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
+            if match:
+                url = match.group(0)
+                break
+                
+        update_site_status(sid, "running", http_proc.pid, url)
+        return True, url
+    except Exception as e:
+        return False, str(e)
+
+def stop_site_process(sid):
+    row = get_site(sid)
+    if not row: return False, "غير موجود"
+    _, _, _, _, _, _, _, pid = row
+    if pid:
+        try: os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except: pass
+    try: subprocess.run(["pkill", "-f", f"http.server {row[4]}"], check=False)
+    except: pass
+    update_site_status(sid, "stopped", None, None)
+    return True, "تم الإيقاف"
+
+# ============ لوحات التحكم ============
+def main_menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 رفع بوت", callback_data="new_bot", style="success")],
+        [InlineKeyboardButton("🤖 بوتاتي", callback_data="my_bots", style="primary")],
+        [InlineKeyboardButton("🌐 رفع موقع", callback_data="new_site", style="success"),
+         InlineKeyboardButton("⭐ مواقعي المرفوعه", callback_data="my_sites", style="primary")],
+        [InlineKeyboardButton("🎯 نقاطي", callback_data="my_points", style="primary"),
+         InlineKeyboardButton("🔗 رابط الدعوة", callback_data="invite_link", style="primary")],
+        [InlineKeyboardButton(f"© {DEV_NAME} ©", url=DEV_URL, style="primary")],
+        [InlineKeyboardButton("↗️ المطور", url=DEV_URL, style="danger"),
+         InlineKeyboardButton("↗️ قناة المطور", url=CHANNEL_URL, style="danger")]
+    ])
+
+def panel_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 إحصائيات", callback_data="p_stats")],
+        [InlineKeyboardButton("📢 إذاعة", callback_data="p_bc")],
+        [InlineKeyboardButton("📢 القنوات", callback_data="p_ch"), InlineKeyboardButton("➕ إضافة قناة", callback_data="p_addch")],
+        [InlineKeyboardButton("💎 ترقية مستخدم (Premium)", callback_data="p_premium")],
+        [InlineKeyboardButton("🤖 إدارة كل البوتات", callback_data="p_all_bots")],
+        [InlineKeyboardButton("🌐 إدارة كل المواقع", callback_data="p_all_sites")]
+    ])
+
+# ============ أوامر البداية ============
+async def start(update, ctx):
+    u = update.effective_user
+    add_user(u.id, u.first_name, u.username)
+    
+    if not await is_subscribed(u.id, ctx):
+        btns = [[InlineKeyboardButton(f"📢 {cn}", url=cl)] for _, cn, cl in get_channels()]
+        btns.append([InlineKeyboardButton("✅ تحقق", callback_data="check_sub")])
+        await update.message.reply_text("🔒 اشترك في القنوات:", reply_markup=InlineKeyboardMarkup(btns))
+        return
+
+    if u.id in DEV_IDS:
+        await update.message.reply_text("👑 أهلاً يا مطور.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛠 لوحة التحكم", callback_data="panel")]]))
+    else:
+        await update.message.reply_text(f"أهلاً {u.first_name} 👋\nاختر من القائمة:", reply_markup=main_menu_kb())
+
+async def check_sub_cb(update, ctx):
+    q = update.callback_query; await q.answer()
+    if await is_subscribed(q.from_user.id, ctx): await q.edit_message_text("✅ تم! ابعت /start.")
+    else: await q.answer("❌ لم تشترك!", show_alert=True)
+
+async def is_subscribed(uid, ctx):
+    channels = get_channels()
+    for cid, _, _ in channels:
+        try:
+            m = await ctx.bot.get_chat_member(cid, uid)
+            if m.status in [ChatMember.LEFT, ChatMember.KICKED]: return False
+        except: pass
+    return True
+
+# ============ الميزات ============
+async def my_points(update, ctx):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("🎯 نقاطك: 0\n\n(قريباً نظام النقاط الفعلي)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back")]]))
+
+async def invite_link(update, ctx):
+    q = update.callback_query; await q.answer()
+    bot_info = await ctx.bot.get_me()
+    link = f"https://t.me/{bot_info.username}?start={q.from_user.id}"
+    await q.edit_message_text(f"🔗 رابط الدعوة:\n`{link}`", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back")]]))
+
+async def back_to_main(update, ctx):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("اختر من القائمة:", reply_markup=main_menu_kb())
+
+# ============ إدارة البوتات (للمستخدم) ============
+async def new_bot_start(update, ctx):
+    q = update.callback_query; await q.answer()
+    user = get_user(q.from_user.id)
+    if count_user_bots(q.from_user.id) >= user[2]:
+        await q.answer(f"❌ وصلت للحد الأقصى ({user[2]} بوت). يرجى التواصل مع المطور لترقية حسابك.", show_alert=True)
+        return ConversationHandler.END
+    await q.edit_message_text("✏️ أرسل اسم البوت:")
+    return NEWBOT_NAME
+
+async def new_bot_name(update, ctx):
+    ctx.user_data["b_name"] = update.message.text.strip()
+    await update.message.reply_text("📤 أرسل ملف `.py` الآن:")
+    return NEWBOT_FILE
+
+async def new_bot_file(update, ctx):
+    doc = update.message.document
+    if not doc or not doc.file_name.endswith(".py"):
+        await update.message.reply_text("❌ أرسل ملف .py فقط.")
+        return NEWBOT_FILE
+    
+    bid = add_bot_db(update.effective_user.id, ctx.user_data["b_name"], "PENDING")
+    bdir = BOTS_DIR / f"bot_{bid}"; bdir.mkdir(exist_ok=True)
+    fpath = bdir / "bot.py"
+    
+    file = await doc.get_file()
+    await file.download_to_drive(str(fpath))
+    
+    conn = db(); c = conn.cursor(); c.execute("UPDATE hosted_bots SET file_path=? WHERE bot_id=?", (str(fpath), bid)); conn.commit(); conn.close()
+    await update.message.reply_text("✅ تم الرفع! اذهب لـ بوتاتي لتشغيله.")
+    ctx.user_data.clear(); return ConversationHandler.END
+
+async def my_bots(update, ctx):
+    q = update.callback_query; await q.answer()
+    bots = get_user_bots(q.from_user.id)
+    if not bots: 
+        await q.edit_message_text("ليس لديك بوتات.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back")]]))
+        return
+    kb = [[InlineKeyboardButton(f"{'🟢' if b[2]=='running' else '🔴'} {b[1]}", callback_data=f"mb_{b[0]}")] for b in bots]
+    kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="back")])
+    await q.edit_message_text("بوتاتك:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def manage_bot(update, ctx):
+    q = update.callback_query; await q.answer()
+    # تم إصلاح الخطأ هنا (استخدام split بدلاً من replace)
+    bid = int(q.data.split("_")[-1])
+    row = get_bot(bid)
+    kb = []
+    if row[4] == "running": kb.append([InlineKeyboardButton("⏹ إيقاف", callback_data=f"stopb_{bid}")])
+    else: kb.append([InlineKeyboardButton("▶️ تشغيل", callback_data=f"startb_{bid}")])
+    kb.append([InlineKeyboardButton("🗑 حذف", callback_data=f"delb_{bid}")])
+    kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="my_bots")])
+    await q.edit_message_text(f"البوت: {row[2]}\nالحالة: {row[4]}", reply_markup=InlineKeyboardMarkup(kb))
+
+async def start_bot_cb(update, ctx):
+    q = update.callback_query; await q.answer()
+    ok, msg = start_bot_process(int(q.data.replace("startb_", "")))
+    await q.answer(msg, show_alert=True); await manage_bot(update, ctx)
+
+async def stop_bot_cb(update, ctx):
+    q = update.callback_query; await q.answer()
+    ok, msg = stop_bot_process(int(q.data.replace("stopb_", "")))
+    await q.answer(msg, show_alert=True); await manage_bot(update, ctx)
+
+async def delete_bot_cb(update, ctx):
+    q = update.callback_query; await q.answer()
+    bid = int(q.data.replace("delb_", ""))
+    stop_bot_process(bid)
+    row = get_bot(bid)
+    if row: shutil.rmtree(Path(row[3]).parent, ignore_errors=True)
+    delete_bot_db(bid); await q.answer("تم الحذف", show_alert=True); await my_bots(update, ctx)
+
+# ============ إدارة المواقع (للمستخدم) ============
+async def new_site_start(update, ctx):
+    q = update.callback_query; await q.answer()
+    user = get_user(q.from_user.id)
+    if count_user_sites(q.from_user.id) >= user[3]:
+        await q.answer(f"❌ وصلت للحد الأقصى ({user[3]} موقع). تواصل مع المطور.", show_alert=True)
+        return ConversationHandler.END
+    await q.edit_message_text("✏️ أرسل اسم الموقع:")
+    return NEWSITE_NAME
+
+async def new_site_name(update, ctx):
+    ctx.user_data["s_name"] = update.message.text.strip()
+    await update.message.reply_text("📤 أرسل ملف `.zip` يحتوي على (index.html):")
+    return NEWSITE_FILE
+
+async def new_site_file(update, ctx):
+    doc = update.message.document
+    if not doc or not doc.file_name.endswith(".zip"):
+        await update.message.reply_text("❌ أرسل ملف .zip فقط.")
+        return NEWSITE_FILE
+    
+    uid = update.effective_user.id
+    port = 8000 + (uid % 1000)
+    sid = add_site_db(uid, ctx.user_data["s_name"], "PENDING", port)
+    sdir = SITES_DIR / f"site_{sid}"; sdir.mkdir(exist_ok=True)
+    zpath = sdir / "site.zip"
+    
+    file = await doc.get_file()
+    await file.download_to_drive(str(zpath))
+    
+    try:
+        with zipfile.ZipFile(zpath, 'r') as zip_ref:
+            zip_ref.extractall(sdir)
+        os.remove(zpath)
+    except:
+        await update.message.reply_text("❌ الملف تالف.")
+        return ConversationHandler.END
+    
+    conn = db(); c = conn.cursor(); c.execute("UPDATE hosted_sites SET file_path=? WHERE site_id=?", (str(sdir), sid)); conn.commit(); conn.close()
+    await update.message.reply_text("✅ تم الرفع! اذهب لـ مواقعي لتشغيله.")
+    ctx.user_data.clear(); return ConversationHandler.END
+
+async def my_sites(update, ctx):
+    q = update.callback_query; await q.answer()
+    sites = get_user_sites(q.from_user.id)
+    if not sites: 
+        await q.edit_message_text("ليس لديك مواقع.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back")]]))
+        return
+    kb = [[InlineKeyboardButton(f"{'🟢' if s[2]=='running' else '🔴'} {s[1]}", callback_data=f"ms_{s[0]}")] for s in sites]
+    kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="back")])
+    await q.edit_message_text("مواقعك:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def manage_site(update, ctx):
+    q = update.callback_query; await q.answer()
+    sid = int(q.data.split("_")[-1]) # تم الإصلاح هنا أيضاً
+    row = get_site(sid)
+    kb = []
+    if row[6] == "running":
+        kb.append([InlineKeyboardButton("⏹ إيقاف", callback_data=f"stops_{sid}")])
+        if row[5]: kb.append([InlineKeyboardButton("🌐 فتح الموقع", url=row[5])])
+    else:
+        kb.append([InlineKeyboardButton("▶️ تشغيل", callback_data=f"starts_{sid}")])
+    kb.append([InlineKeyboardButton("🗑 حذف", callback_data=f"dels_{sid}")])
+    kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="my_sites")])
+    await q.edit_message_text(f"الموقع: {row[2]}\nالحالة: {row[6]}\nالرابط: {row[5] if row[5] else 'لا يوجد'}", reply_markup=InlineKeyboardMarkup(kb))
+
+async def start_site_cb(update, ctx):
+    q = update.callback_query; await q.answer("جاري التشغيل (يستغرق 5 ثواني)...")
+    ok, msg = start_site_process(int(q.data.replace("starts_", "")))
+    if not ok: await q.answer(f"❌ {msg}", show_alert=True)
+    await manage_site(update, ctx)
+
+async def stop_site_cb(update, ctx):
+    q = update.callback_query; await q.answer()
+    stop_site_process(int(q.data.replace("stops_", "")))
+    await q.answer("تم الإيقاف", show_alert=True); await manage_site(update, ctx)
+
+async def delete_site_cb(update, ctx):
+    q = update.callback_query; await q.answer()
+    sid = int(q.data.replace("dels_", ""))
+    stop_site_process(sid); row = get_site(sid)
+    if row: shutil.rmtree(Path(row[3]).parent, ignore_errors=True)
+    delete_site_db(sid); await q.answer("تم الحذف", show_alert=True); await my_sites(update, ctx)
+
+# ============ لوحة تحكم المطور ============
+async def panel(update, ctx):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("🛠 لوحة التحكم", reply_markup=panel_kb())
+
+async def p_stats(update, ctx):
+    q = update.callback_query; await q.answer()
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users"); u = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM hosted_bots"); b = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM hosted_sites"); s = c.fetchone()[0]
+    conn.close()
+    await q.edit_message_text(f"📊 الإحصائيات:\nالمستخدمين: {u}\nالبوتات: {b}\nالمواقع: {s}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="panel")]]))
+
+async def p_premium_start(update, ctx):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("أرسل آيدي المستخدم (ID):")
+    return SET_LIMIT_ID
+
+async def p_premium_id(update, ctx):
+    ctx.user_data["p_uid"] = update.message.text.strip()
+    await update.message.reply_text("أرسل عدد البوتات المسموح بها:")
+    return SET_LIMIT_BOTS
+
+async def p_premium_bots(update, ctx):
+    ctx.user_data["p_bots"] = update.message.text.strip()
+    await update.message.reply_text("أرسل عدد المواقع المسموح بها:")
+    return SET_LIMIT_SITES
+
+async def p_premium_sites(update, ctx):
+    try:
+        uid = int(ctx.user_data["p_uid"]); bots = int(ctx.user_data["p_bots"]); sites = int(update.message.text.strip())
+        set_user_limits(uid, bots, sites)
+        await update.message.reply_text(f"✅ تم ترقية {uid}:\nبوتات: {bots}\nمواقع: {sites}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطأ: {e}")
+    ctx.user_data.clear(); return ConversationHandler.END
+
+async def p_all_bots(update, ctx):
+    q = update.callback_query; await q.answer()
+    conn = db(); c = conn.cursor(); c.execute("SELECT bot_id, name, status FROM hosted_bots"); bots = c.fetchall(); conn.close()
+    kb = [[InlineKeyboardButton(f"{'🟢' if b[2]=='running' else '🔴'} {b[1]}", callback_data=f"pmb_{b[0]}")] for b in bots]
+    kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="panel")])
+    await q.edit_message_text("كل البوتات:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def p_all_sites(update, ctx):
+    q = update.callback_query; await q.answer()
+    conn = db(); c = conn.cursor(); c.execute("SELECT site_id, name, status FROM hosted_sites"); sites = c.fetchall(); conn.close()
+    kb = [[InlineKeyboardButton(f"{'🟢' if s[2]=='running' else '🔴'} {s[1]}", callback_data=f"pms_{s[0]}")] for s in sites]
+    kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="panel")])
+    await q.edit_message_text("كل المواقع:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def cancel(update, ctx):
+    await update.message.reply_text("تم الإلغاء."); ctx.user_data.clear(); return ConversationHandler.END
+
+# ============ التشغيل ============
+def main():
+    try: asyncio.get_event_loop()
+    except RuntimeError: asyncio.set_event_loop(asyncio.new_event_loop())
+
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(new_bot_start, pattern="^new_bot$")], states={NEWBOT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_bot_name)], NEWBOT_FILE: [MessageHandler(filters.Document.ALL, new_bot_file)]}, fallbacks=[CommandHandler("cancel", cancel)]))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(new_site_start, pattern="^new_site$")], states={NEWSITE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_site_name)], NEWSITE_FILE: [MessageHandler(filters.Document.ALL, new_site_file)]}, fallbacks=[CommandHandler("cancel", cancel)]))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(p_premium_start, pattern="^p_premium$")], states={SET_LIMIT_ID: [MessageHandler(filters.TEXT, p_premium_id)], SET_LIMIT_BOTS: [MessageHandler(filters.TEXT, p_premium_bots)], SET_LIMIT_SITES: [MessageHandler(filters.TEXT, p_premium_sites)]}, fallbacks=[CommandHandler("cancel", cancel)]))
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("panel", lambda u,c: panel(u,c) if u.effective_user.id in DEV_IDS else None))
+    app.add_handler(CommandHandler("cancel", cancel))
+
+    app.add_handler(CallbackQueryHandler(check_sub_cb, pattern="^check_sub$"))
+    app.add_handler(CallbackQueryHandler(back_to_main, pattern="^back$"))
+    app.add_handler(CallbackQueryHandler(my_points, pattern="^my_points$"))
+    app.add_handler(CallbackQueryHandler(invite_link, pattern="^invite_link$"))
+    
+    app.add_handler(CallbackQueryHandler(my_bots, pattern="^my_bots$"))
+    app.add_handler(CallbackQueryHandler(manage_bot, pattern="^mb_"))
+    app.add_handler(CallbackQueryHandler(start_bot_cb, pattern="^startb_"))
+    app.add_handler(CallbackQueryHandler(stop_bot_cb, pattern="^stopb_"))
+    app.add_handler(CallbackQueryHandler(delete_bot_cb, pattern="^delb_"))
+    
+    app.add_handler(CallbackQueryHandler(my_sites, pattern="^my_sites$"))
+    app.add_handler(CallbackQueryHandler(manage_site, pattern="^ms_"))
+    app.add_handler(CallbackQueryHandler(start_site_cb, pattern="^starts_"))
+    app.add_handler(CallbackQueryHandler(stop_site_cb, pattern="^stops_"))
+    app.add_handler(CallbackQueryHandler(delete_site_cb, pattern="^dels_"))
+
+    app.add_handler(CallbackQueryHandler(panel, pattern="^panel$"))
+    app.add_handler(CallbackQueryHandler(p_stats, pattern="^p_stats$"))
+    app.add_handler(CallbackQueryHandler(p_all_bots, pattern="^p_all_bots$"))
+    app.add_handler(CallbackQueryHandler(p_all_sites, pattern="^p_all_sites$"))
+    app.add_handler(CallbackQueryHandler(manage_bot, pattern="^pmb_"))
+    app.add_handler(CallbackQueryHandler(manage_site, pattern="^pms_"))
+
+    print("✅ Professional Platform Started...")
+    try: app.run_polling()
+    except KeyboardInterrupt: sys.exit(0)
+
+if __name__ == "__main__": main()
